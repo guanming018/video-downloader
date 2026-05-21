@@ -3,6 +3,7 @@ import re
 import asyncio
 import json
 import uuid
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -112,6 +113,40 @@ EXTRACTOR_ARGS = {
     "TikTok": "tiktok:app_version=34.1.0;manifest_app_version=34.1.0",
 }
 
+# —— Cookie auto-extraction for platforms that require them (抖音 etc.) ——
+COOKIES_FILE: Optional[str] = None
+
+def _extract_cookies():
+    """Try to get browser cookies for known cookie-needy platforms
+    and write them to a temp Netscape-format file."""
+    domains = ["douyin.com", "iesdouyin.com"]
+    try:
+        import browser_cookie3
+        jar = browser_cookie3.chrome(domain_name="douyin.com")
+        cookies = list(jar)
+        if not cookies:
+            jar = browser_cookie3.edge(domain_name="douyin.com")
+            cookies = list(jar)
+    except Exception:
+        return None
+
+    if not cookies:
+        return None
+
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="dy_cookies_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("# Netscape HTTP Cookie File\n")
+            for c in cookies:
+                domain = c.domain if c.domain.startswith(".") else "." + c.domain
+                f.write(f"{domain}\tTRUE\t/\tFALSE\t0\t{c.name}\t{c.value}\n")
+        return path
+    except Exception:
+        os.unlink(path)
+        return None
+
+COOKIES_FILE = _extract_cookies()
+
 
 def extract_url(text: str) -> str:
     """Extract the first recognizable video URL from pasted text."""
@@ -175,6 +210,9 @@ def build_ytdlp_args(url: str, platform: str, extra_args: list = None) -> list:
         "--no-playlist",
         "--no-warnings",
     ]
+    # Add cookies if available (抖音/TikTok need them)
+    if COOKIES_FILE:
+        cmd.extend(["--cookies", COOKIES_FILE])
     # Add platform-specific extractor args
     ea = EXTRACTOR_ARGS.get(platform)
     if ea:
@@ -191,6 +229,12 @@ def friendly_error(err_msg: str, url: str) -> str:
     if "Unsupported URL" in msg:
         return "该链接格式暂不支持下载，可能是链接已过期或不完整。\n请尝试：\n1. 在浏览器中打开确认链接有效\n2. 只粘贴纯视频链接（不要带多余文字）\n3. 确认是视频页面链接而非频道/主页链接"
     if "cookies" in msg.lower() or "Fresh cookies" in msg or "Login" in msg or "login required" in msg.lower():
+        if "douyin" in msg.lower():
+            return ("抖音需要浏览器登录信息才能下载。\n\n"
+                    "解决办法（任选一种）：\n"
+                    "1. 在 Chrome 浏览器中登录抖音账号，然后重启本工具即可自动获取 cookies\n"
+                    "2. 安装 EditThisCookie 插件导出 cookies.txt，放在本目录下\n"
+                    "3. 换个公开 B站视频试试（B站无需登录即可下载）")
         return "该视频需要登录才能下载。这是平台限制，目前无法绕过。建议换一个公开视频链接试试。"
     if "Video unavailable" in msg:
         return "该视频不可用（可能已被删除或设为私密）"
@@ -483,9 +527,11 @@ async def index():
 
 if __name__ == "__main__":
     ffmpeg_status = "已安装（支持音视频合并）" if HAS_FFMPEG else "未安装（下载可能为音视频分离文件）"
+    cookie_status = "已获取（抖音可下载）" if COOKIES_FILE else "未获取（抖音需在Chrome登录后重启本工具）"
     print("=" * 50)
     print("  视频下载服务已启动（无需登录）")
     print(f"  FFmpeg: {ffmpeg_status}")
+    print(f"  抖音Cookie: {cookie_status}")
     print(f"  访问地址: http://localhost:16888")
     print("=" * 50)
     uvicorn.run(app, host="0.0.0.0", port=16888)
