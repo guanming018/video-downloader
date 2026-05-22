@@ -4,6 +4,7 @@ import asyncio
 import json
 import uuid
 import tempfile
+import concurrent.futures
 from pathlib import Path
 from typing import Optional
 
@@ -12,6 +13,16 @@ from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+
+# curl_cffi is optional — only needed for Douyin downloads
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
+
+# Thread pool for running synchronous curl_cffi calls
+_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
 app = FastAPI(title="Video Downloader")
 
@@ -118,26 +129,47 @@ COOKIES_FILE: Optional[str] = None
 
 def _extract_cookies():
     """Try to get browser cookies for known cookie-needy platforms
-    and write them to a temp Netscape-format file."""
-    domains = ["douyin.com", "iesdouyin.com"]
+    and write them to a temp Netscape-format file.
+
+    Browser priority: Firefox > Edge > Chrome.
+    Chrome/Edge use DPAPI encryption — cookies can't be read when
+    they are running under a different Windows user.  Firefox stores
+    cookies in plaintext (unlocked.db) so it works much more reliably.
+    """
+    import importlib
     try:
-        import browser_cookie3
-        jar = browser_cookie3.chrome(domain_name="douyin.com")
-        cookies = list(jar)
-        if not cookies:
-            jar = browser_cookie3.edge(domain_name="douyin.com")
-            cookies = list(jar)
-    except Exception:
+        mod = importlib.import_module("browser_cookie3")
+    except ImportError:
         return None
 
-    if not cookies:
+    browsers = [
+        ("firefox", mod.firefox),
+        ("edge", mod.edge),
+        ("chrome", mod.chrome),
+    ]
+    all_cookies = []
+    for name, load_fn in browsers:
+        try:
+            jar = load_fn(domain_name="douyin.com")
+            ck = list(jar)
+            if ck:
+                all_cookies = ck
+                break
+        except Exception:
+            continue
+
+    if not all_cookies:
         return None
 
     fd, path = tempfile.mkstemp(suffix=".txt", prefix="dy_cookies_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write("# Netscape HTTP Cookie File\n")
-            for c in cookies:
+            seen = set()
+            for c in all_cookies:
+                if c.name in seen:
+                    continue
+                seen.add(c.name)
                 domain = c.domain if c.domain.startswith(".") else "." + c.domain
                 f.write(f"{domain}\tTRUE\t/\tFALSE\t0\t{c.name}\t{c.value}\n")
         return path
@@ -202,6 +234,11 @@ def detect_platform(url: str) -> Optional[str]:
     return None
 
 
+def _is_douyin_url(url: str) -> bool:
+    """Redundant douyin check used when detect_platform may fail on resolved URLs."""
+    return bool(re.search(r'douyin\.com|iesdouyin\.com', url, re.IGNORECASE))
+
+
 def build_ytdlp_args(url: str, platform: str, extra_args: list = None) -> list:
     """Build yt-dlp command args with best-effort settings."""
     cmd = [
@@ -264,6 +301,223 @@ def friendly_error(err_msg: str, url: str) -> str:
     return msg
 
 
+# —— Custom Douyin downloader (bypasses yt-dlp's broken X-Bogus extractor) ——
+
+DOUYIN_UA = "Aweme/2.8.0 (iPhone; iOS 11.0; Scale/2.00)"
+
+EXTRA_DOWNLOAD_HEADERS = {
+    "Referer": "https://www.douyin.com/",
+    "Accept": "*/*",
+}
+
+def _cookie_file_to_http_header() -> str:
+    """Read the Netscape-format cookie file and return a Cookie header string."""
+    if not COOKIES_FILE:
+        return ""
+    try:
+        with open(COOKIES_FILE, "r", encoding="utf-8") as f:
+            parts = []
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                fields = line.split("\t")
+                if len(fields) >= 7:
+                    parts.append(f"{fields[5]}={fields[6]}")
+            return "; ".join(parts)
+    except Exception:
+        return ""
+
+
+def _get_douyin_aweme_detail(video_id: str) -> Optional[dict]:
+    """Fetch aweme_detail dict from Douyin via mobile feed API.
+
+    Uses curl_cffi with Safari 15.5 impersonation to bypass TLS fingerprinting.
+
+    Multiple strategies are tried because the feed API is stateless and the
+    target video may not appear in every response.
+
+    Returns the full aweme dict (metadata + video URLs) or None.
+    """
+    if not HAS_CURL_CFFI:
+        return None
+
+    cookie_str = _cookie_file_to_http_header()
+    base_headers = {"User-Agent": DOUYIN_UA, "Accept": "*/*"}
+    if cookie_str:
+        base_headers["Cookie"] = cookie_str
+
+    import time
+
+    # Strategy 1: Feed API with aweme_id (retry 4 times with delay)
+    for attempt in range(4):
+        try:
+            resp = curl_requests.get(
+                "https://aweme.snssdk.com/aweme/v1/feed/",
+                params={"aweme_id": video_id, "count": "12", "type": "0"},
+                headers=base_headers,
+                impersonate="safari15_5",
+                timeout=20,
+            )
+            if resp.status_code == 200 and resp.content:
+                data = resp.json()
+                if data.get("status_code") == 0:
+                    for item in data.get("aweme_list", []):
+                        if item.get("aweme_id") == video_id:
+                            return item
+        except Exception:
+            if attempt < 3:
+                time.sleep(1)  # brief pause between retries
+            continue
+
+    # Strategy 2: Feed API with 'id' param instead of 'aweme_id'
+    try:
+        resp = curl_requests.get(
+            "https://aweme.snssdk.com/aweme/v1/feed/",
+            params={"id": video_id, "count": "12", "type": "0"},
+            headers=base_headers,
+            impersonate="safari15_5",
+            timeout=15,
+        )
+        if resp.status_code == 200 and resp.content:
+            data = resp.json()
+            if data.get("status_code") == 0:
+                for item in data.get("aweme_list", []):
+                    if item.get("aweme_id") == video_id:
+                        return item
+    except Exception:
+        pass
+
+    # Strategy 3: Feed API with source=6 (detail-page context)
+    try:
+        resp = curl_requests.get(
+            "https://aweme.snssdk.com/aweme/v1/feed/",
+            params={"aweme_id": video_id, "count": "6", "source": "6"},
+            headers=base_headers,
+            impersonate="safari15_5",
+            timeout=15,
+        )
+        if resp.status_code == 200 and resp.content:
+            data = resp.json()
+            if data.get("status_code") == 0:
+                for item in data.get("aweme_list", []):
+                    if item.get("aweme_id") == video_id:
+                        return item
+    except Exception:
+        pass
+
+    return None
+
+
+def _parse_douyin_formats(aweme: dict) -> tuple:
+    """Extract format list and best video URL from a Douyin aweme dict.
+
+    Returns (formats, best_url, meta_dict).
+    """
+    video = aweme.get("video", {})
+    title = aweme.get("desc", f"douyin_{aweme.get('aweme_id', 'unknown')}")
+    author = aweme.get("author", {}).get("nickname", "")
+    duration = video.get("duration", 0) // 1000  # ms → s
+    thumbnail = ""
+    covers = video.get("cover", {}).get("url_list", [])
+    if covers:
+        thumbnail = covers[0]
+
+    formats = []
+    best_url = None
+
+    # 1. Bit-rate-based quality tiers (most reliable)
+    for br in video.get("bit_rate", []):
+        gear = br.get("gear_name", "")
+        br_urls = br.get("play_addr", {}).get("url_list", [])
+        if br_urls:
+            url = br_urls[0]
+            h = br.get("play_addr", {}).get("height", 0)
+            w = br.get("play_addr", {}).get("width", 0)
+            resolution = f"{w}x{h}" if w and h else gear
+            formats.append({
+                "format_id": f"douyin_{gear}" if gear else f"br_{h}p",
+                "ext": "mp4",
+                "resolution": resolution,
+                "filesize": 0,
+                "vcodec": "avc1",
+                "acodec": "mp4a",
+                "fps": 30,
+                "is_video": True,
+                "is_audio": False,
+            })
+            if not best_url:
+                best_url = url
+
+    # 2. download_addr (watermarked, shorter)
+    dl_addr = video.get("download_addr", {})
+    dl_urls = dl_addr.get("url_list", [])
+    if dl_urls:
+        if len(formats) == 0:
+            formats.append({
+                "format_id": "download",
+                "ext": "mp4",
+                "resolution": "540p",
+                "filesize": 0,
+                "vcodec": "avc1",
+                "acodec": "mp4a",
+                "fps": 30,
+                "is_video": True,
+                "is_audio": False,
+            })
+        if not best_url:
+            best_url = dl_urls[0]
+
+    # 3. Fallback: play_addr (preview)
+    if not best_url:
+        play_addr = video.get("play_addr", {})
+        pu = play_addr.get("url_list", [])
+        if pu:
+            best_url = pu[0]
+            if len(formats) == 0:
+                formats.append({
+                    "format_id": "play",
+                    "ext": "mp4",
+                    "resolution": "540p",
+                    "filesize": 0,
+                    "vcodec": "avc1",
+                    "acodec": "mp4a",
+                    "fps": 30,
+                    "is_video": True,
+                    "is_audio": False,
+                })
+
+    return formats, best_url, {
+        "title": title,
+        "author": author,
+        "duration": duration,
+        "thumbnail": thumbnail,
+    }
+
+
+def _download_douyin_url(url: str, output_path: str) -> bool:
+    """Download a Douyin video CDN URL to a local file.
+
+    curl_cffi handles TLS fingerprinting for the CDN.  The Referer header
+    is required by ByteDance's CDN to serve the file.
+    """
+    if not HAS_CURL_CFFI:
+        return False
+    try:
+        h = {"User-Agent": DOUYIN_UA, **EXTRA_DOWNLOAD_HEADERS}
+        cookie_str = _cookie_file_to_http_header()
+        if cookie_str:
+            h["Cookie"] = cookie_str
+        resp = curl_requests.get(url, headers=h, impersonate="safari15_5", timeout=120)
+        if resp.status_code == 200 and len(resp.content) > 1024:
+            with open(output_path, "wb") as f:
+                f.write(resp.content)
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def _resolve_short_url_sync(url: str) -> str:
     """Resolve short URL redirects using Python's built-in urllib (no external curl needed).
 
@@ -296,6 +550,9 @@ def _resolve_short_url_sync(url: str) -> str:
             # Bilibili: strip query params from redirected URL
             if "bilibili.com" in final_url:
                 return final_url.split("?")[0]
+            # Strip query params for Douyin resolved URLs
+            if "douyin.com" in final_url:
+                return final_url.split("?")[0]
             return final_url
     except Exception:
         pass
@@ -316,10 +573,120 @@ def parse_resolution(res: str) -> int:
 @app.get("/api/info")
 async def get_video_info(url: str = Query(..., description="Video URL")):
     url = extract_url(url)
+
+    # Validate URL: reject partial/incomplete pastes like "https://v"
+    if len(url) < 10 or (url.startswith("http") and url.count("/") < 3):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "链接不完整",
+                "detail": "视频链接不完整，请复制完整的视频链接后重新粘贴。\n\n"
+                          "正确做法：在浏览器打开视频页面 → 复制地址栏完整链接 → 粘贴到输入框",
+            },
+        )
+
     url = await resolve_short_url(url)
     platform = detect_platform(url) or "unknown"
 
-    # Let yt-dlp decide if it can handle the URL — don't gate on our own detection
+    # Redundant douyin check: even if detect_platform missed it
+    # (e.g. unusual redirect or short URL pattern), force the custom path.
+    if platform != "抖音" and _is_douyin_url(url):
+        platform = "抖音"
+
+    # —— Douyin uses a custom downloader (yt-dlp's extractor is broken) ——
+    if platform == "抖音":
+        m = re.search(r"video/(\d+)", url)
+        if not m:
+            raise HTTPException(status_code=400, detail="无法识别抖音视频 ID")
+        video_id = m.group(1)
+
+        loop = asyncio.get_event_loop()
+        aweme = await loop.run_in_executor(_EXECUTOR, _get_douyin_aweme_detail, video_id)
+        if not aweme:
+            # Fallback: try yt-dlp with cookies (some videos work this way)
+            yt_dlp_fallback_cmd = build_ytdlp_args(url, "抖音", ["--dump-json"])
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *yt_dlp_fallback_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                yt_stdout, yt_stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                if proc.returncode == 0 and yt_stdout:
+                    yt_data = json.loads(yt_stdout.decode("utf-8", errors="replace"))
+                    # Reuse the yt-dlp response formatter below by falling through
+                    data = yt_data
+                    platform = "抖音"
+                    # Jump to the yt-dlp response formatting section
+                    formats = []
+                    seen = set()
+                    for f in data.get("formats", []):
+                        key = (f.get("ext", ""), f.get("resolution", ""), f.get("vcodec", "none"), f.get("acodec", "none"))
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        vcodec = f.get("vcodec", "none")
+                        acodec = f.get("acodec", "none")
+                        is_video = vcodec != "none"
+                        is_audio = acodec != "none" and vcodec == "none"
+                        formats.append({
+                            "format_id": f.get("format_id", ""),
+                            "ext": f.get("ext", ""),
+                            "resolution": f.get("resolution", ""),
+                            "filesize": f.get("filesize") or f.get("filesize_approx") or 0,
+                            "vcodec": vcodec,
+                            "acodec": acodec,
+                            "fps": f.get("fps") or 0,
+                            "is_video": is_video,
+                            "is_audio": is_audio,
+                        })
+                    formats.sort(key=lambda x: (
+                        0 if x["is_video"] else 1 if x["is_audio"] else 2,
+                        -parse_resolution(x["resolution"]),
+                    ))
+                    return {
+                        "title": data.get("title", "抖音视频"),
+                        "platform": "抖音",
+                        "duration": data.get("duration", 0),
+                        "thumbnail": data.get("thumbnail", ""),
+                        "formats": formats,
+                        "url": url,
+                        "uploader": data.get("uploader", ""),
+                    }
+            except Exception:
+                pass
+
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "获取信息失败",
+                    "detail": (
+                        "抖音视频获取失败。可能原因：\n"
+                        "1. 视频已删除或作者设为私密\n"
+                        "2. 未登录抖音账号（请用 Chrome 登录抖音后重启本工具）\n"
+                        "3. curl_cffi 未安装（请运行 pip install curl_cffi）"
+                    ),
+                },
+            )
+
+        formats, best_url, meta = _parse_douyin_formats(aweme)
+        if not formats:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "获取信息失败", "detail": "未找到可下载的视频格式"},
+            )
+
+        return {
+            "title": meta["title"],
+            "platform": platform,
+            "duration": meta["duration"],
+            "thumbnail": meta["thumbnail"],
+            "formats": formats,
+            "url": url,
+            "uploader": meta["author"],
+        }
+
+    # —— All other platforms use yt-dlp ——
     cmd = build_ytdlp_args(url, platform if platform != "unknown" else "generic", ["--dump-json"])
 
     try:
@@ -336,8 +703,6 @@ async def get_video_info(url: str = Query(..., description="Video URL")):
 
     if proc.returncode != 0:
         err_msg = stderr.decode("utf-8", errors="replace").strip()
-        # If yt-dlp says unsupported AND we also couldn't detect the platform,
-        # give the user a list of known supported platforms
         if platform == "unknown" and ("Unsupported URL" in err_msg or "is not a valid URL" in err_msg or "No suitable extractor" in err_msg):
             supported = "、".join(PLATFORM_PATTERNS.keys())
             detail = f"该链接指向的平台暂不支持下载。\n当前支持的平台：{supported}\n\n如果链接来自以上平台，请确认：\n1. 粘贴的是完整视频链接\n2. 链接为公开视频（非私密或需登录）"
@@ -406,7 +771,101 @@ async def download_video(
     url = await resolve_short_url(url)
     platform = detect_platform(url)
 
+    # Redundant douyin check
+    if platform != "抖音" and _is_douyin_url(url):
+        platform = "抖音"
+
     task_id = uuid.uuid4().hex[:12]
+
+    # —— Douyin custom download path ——
+    if platform == "抖音":
+        m = re.search(r"video/(\d+)", url)
+        if not m:
+            raise HTTPException(status_code=400, detail="无法识别抖音视频 ID")
+        video_id = m.group(1)
+
+        PROGRESS_MAP[task_id] = {"status": "downloading", "progress": "0%", "speed": "", "eta": ""}
+
+        async def run_douyin_download():
+            try:
+                loop = asyncio.get_event_loop()
+                aweme = await loop.run_in_executor(_EXECUTOR, _get_douyin_aweme_detail, video_id)
+                if not aweme:
+                    # Fallback: try yt-dlp to get video info
+                    PROGRESS_MAP[task_id] = {"status": "downloading", "progress": "10%", "speed": "", "eta": "通过备用接口获取..."}
+                    yt_cmd = build_ytdlp_args(url, "抖音", ["--dump-json"])
+                    try:
+                        yt_proc = await asyncio.create_subprocess_exec(
+                            *yt_cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        yt_stdout, yt_stderr = await asyncio.wait_for(yt_proc.communicate(), timeout=30)
+                        if yt_proc.returncode == 0 and yt_stdout:
+                            yt_data = json.loads(yt_stdout.decode("utf-8", errors="replace"))
+                            # Get best video URL from yt-dlp data
+                            for f in yt_data.get("formats", []):
+                                vcodec = f.get("vcodec", "none")
+                                if vcodec != "none" and f.get("url"):
+                                    best_url = f["url"]
+                                    break
+                            if not best_url:
+                                yt_urls = re.findall(r'https?://[^"\']+\.(?:mp4|m3u8)[^"\']*', json.dumps(yt_data))
+                                best_url = yt_urls[0] if yt_urls else None
+                            if best_url:
+                                safe_name = re.sub(r'[\\/*?:"<>|]', "", yt_data.get("title", "douyin_video"))[:80] or f"douyin_{video_id}"
+                                output_path = str(DOWNLOAD_DIR / f"{safe_name}.mp4")
+                                PROGRESS_MAP[task_id] = {"status": "downloading", "progress": "50%", "speed": "", "eta": ""}
+                                ok = await loop.run_in_executor(_EXECUTOR, _download_douyin_url, best_url, output_path)
+                                if ok:
+                                    PROGRESS_MAP[task_id] = {
+                                        "status": "completed",
+                                        "file": output_path,
+                                        "filename": Path(output_path).name,
+                                    }
+                                    return
+                    except Exception:
+                        pass
+                    PROGRESS_MAP[task_id] = {"status": "error", "error": "获取视频信息失败"}
+                    return
+
+                formats, best_url, meta = _parse_douyin_formats(aweme)
+                if not best_url:
+                    PROGRESS_MAP[task_id] = {"status": "error", "error": "未找到可下载的视频地址"}
+                    return
+
+                # Build safe filename
+                safe_name = re.sub(r'[\\/*?:"<>|]', "", meta["title"])[:80] or f"douyin_{video_id}"
+                output_path = str(DOWNLOAD_DIR / f"{safe_name}.mp4")
+
+                PROGRESS_MAP[task_id] = {"status": "downloading", "progress": "50%", "speed": "", "eta": ""}
+
+                ok = await loop.run_in_executor(_EXECUTOR, _download_douyin_url, best_url, output_path)
+                if ok:
+                    PROGRESS_MAP[task_id] = {
+                        "status": "completed",
+                        "file": output_path,
+                        "filename": Path(output_path).name,
+                    }
+                else:
+                    PROGRESS_MAP[task_id] = {"status": "error", "error": "下载失败（403 禁止访问或链接已过期）"}
+            except Exception as e:
+                err_msg = str(e)
+                # Translate common curl_cffi errors to user-friendly Chinese
+                if "Connection" in err_msg or "connection" in err_msg:
+                    friendly = "网络连接失败，请检查网络后重试"
+                elif "Timeout" in err_msg or "timed out" in err_msg:
+                    friendly = "请求超时，请检查网络后重试"
+                elif "403" in err_msg:
+                    friendly = "下载被拒绝（403），链接可能已过期"
+                else:
+                    friendly = f"下载出错：{err_msg[:120]}"
+                PROGRESS_MAP[task_id] = {"status": "error", "error": friendly}
+
+        asyncio.create_task(run_douyin_download())
+        return {"task_id": task_id, "status": "started"}
+
+    # —— All other platforms use yt-dlp ——
     output_template = str(DOWNLOAD_DIR / f"%(title)s_%(id)s.%(ext)s")
 
     if format_id in ("best", "bestvideo"):
@@ -414,7 +873,11 @@ async def download_video(
     elif format_id == "bestaudio":
         fmt_str = "bestaudio/best"
     else:
-        fmt_str = format_id
+        # User selected a specific format (e.g. a DASH video-only stream).
+        # Append +bestaudio so yt-dlp also downloads the audio track and merges
+        # them with ffmpeg.  Without this, selecting a video-only DASH format
+        # (which is the norm on Bilibili, YouTube etc.) gives a silent file.
+        fmt_str = f"{format_id}+bestaudio/{format_id}"
 
     extra_args = [
         "-f", fmt_str,
@@ -526,12 +989,15 @@ async def index():
 
 
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "16888"))
     ffmpeg_status = "已安装（支持音视频合并）" if HAS_FFMPEG else "未安装（下载可能为音视频分离文件）"
-    cookie_status = "已获取（抖音可下载）" if COOKIES_FILE else "未获取（抖音需在Chrome登录后重启本工具）"
+    dy_status = "已获取（抖音可下载）" if COOKIES_FILE else "未获取（抖音需在Chrome登录后重启本工具）"
+    cu_status = "已安装（抖音专用）" if HAS_CURL_CFFI else "未安装（抖音需 pip install curl_cffi）"
     print("=" * 50)
     print("  视频下载服务已启动（无需登录）")
     print(f"  FFmpeg: {ffmpeg_status}")
-    print(f"  抖音Cookie: {cookie_status}")
-    print(f"  访问地址: http://localhost:16888")
+    print(f"  抖音Cookie: {dy_status}")
+    print(f"  抖音引擎: {cu_status}")
+    print(f"  访问地址: http://localhost:{port}")
     print("=" * 50)
-    uvicorn.run(app, host="0.0.0.0", port=16888)
+    uvicorn.run(app, host="0.0.0.0", port=port)

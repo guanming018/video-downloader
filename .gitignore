@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+downloads/
+*.mp4
+*.m4a
+dy_test.json
+*.txt

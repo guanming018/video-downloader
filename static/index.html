@@ -494,7 +494,9 @@
         // Extract a clean URL from pasted text
         function extractUrl(text) {
             // Find all http/https URLs in the text
-            const allUrls = text.match(/https?:\/\/[^\s,，。.？?！!、"]+/g);
+            // Note: only whitespace, quotes, and Chinese punctuation are stop chars
+            // Period '.' and '?' are VALID URL chars (v.douyin.com, ?v=xxx)
+            const allUrls = text.match(/https?:\/\/[^\s"、，。？！!]+/g);
             if (!allUrls) return text;
 
             // Return the first URL that matches a known platform
@@ -535,6 +537,11 @@
             }
 
             const url = extractUrl(raw);
+            // Validate URL length: a valid video URL is at least 15 chars
+            if (url.length < 15) {
+                showError('链接太短或不完整，请粘贴完整的视频链接');
+                return;
+            }
             // Detect platform from either extracted URL or raw text
             const platform = findPlatformInText(url) || findPlatformInText(raw);
             if (!platform) {
@@ -746,6 +753,13 @@
             let actionHtml = '';
             if (data.status === 'completed' && data.filename) {
                 actionHtml = `<div class="qi-action"><a href="/downloads/${encodeURIComponent(data.filename)}" download>点击下载视频</a></div>`;
+                // Auto-trigger download after a short delay
+                setTimeout(() => {
+                    const a = document.createElement('a');
+                    a.href = '/downloads/' + encodeURIComponent(data.filename);
+                    a.download = data.filename;
+                    a.click();
+                }, 300);
             }
             if (data.status === 'error' && data.error) {
                 actionHtml = `<div class="qi-action" style="color:var(--text2);font-size:13px;">${data.error}</div>`;
